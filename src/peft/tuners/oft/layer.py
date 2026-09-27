@@ -290,15 +290,13 @@ class OFTRotationModule(nn.Module):
         Returns:
             `torch.Tensor`: The delta weight applied by this OFT layer.
         """
-        weight = self.weight
-
         if self.coft:
             with torch.no_grad():
-                weight = self._project_batch(weight, eps=self.eps)
-                self.weight.copy_(weight)
+                self.weight.copy_(self._project_batch(self.weight, eps=self.eps))
 
+        # use the parameter itself, not the projected copy, so that the result stays differentiable
         orth_rotate = self._cayley_batch(
-            weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms
+            self.weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms
         )
 
         rank = self.r if not self.block_share else self.in_features // self.block_size
@@ -723,7 +721,8 @@ class Conv2d(nn.Module, OFTLayer):
         if base_layer.dilation[0] > 1:
             raise ValueError("Conv2d with dilation > 1 is not supported by OFT.")
 
-        conv_filter_dim = self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0]
+        # the rotation acts on the flattened filter of one output channel, i.e. on (in_channels // groups) * kh * kw
+        conv_filter_dim = base_layer.weight[0].numel()
 
         if r == 0 and oft_block_size != 0:
             if conv_filter_dim % oft_block_size != 0 or oft_block_size > conv_filter_dim:
@@ -797,16 +796,13 @@ class Conv2d(nn.Module, OFTLayer):
                     # quantized layers need dequantize -> modify -> re-quantize.
                     orig_weight = self.get_base_weight()
                     orig_dtype = orig_weight.dtype
+                    orig_shape = orig_weight.shape
 
-                    orig_weight = orig_weight.view(
-                        self.out_features, self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0]
-                    )
+                    orig_weight = orig_weight.view(self.out_features, -1)
                     orig_weight = torch.transpose(orig_weight, 0, 1)
                     orig_weight = torch.mm(oft_mat, orig_weight.to(oft_mat.dtype))
                     orig_weight = torch.transpose(orig_weight, 0, 1)
-                    orig_weight = orig_weight.view(
-                        self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0]
-                    )
+                    orig_weight = orig_weight.view(orig_shape)
 
                     if safe_merge:
                         # Note that safe_merge will be slower than the normal merge
@@ -821,9 +817,7 @@ class Conv2d(nn.Module, OFTLayer):
                     # Non-quantized unsafe merge: write the result directly into the
                     # existing weight storage to avoid the extra copy that
                     # set_base_weight would create via .contiguous().
-                    weight = base_layer.weight.data.view(
-                        self.out_features, self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0]
-                    )
+                    weight = base_layer.weight.data.view(self.out_features, -1)
                     result = torch.mm(oft_mat, weight.t().to(oft_mat.dtype))
                     weight.copy_(result.t())
 
@@ -849,19 +843,12 @@ class Conv2d(nn.Module, OFTLayer):
 
                 orig_weight = self.get_base_weight()
                 orig_dtype = orig_weight.dtype
-                orig_weight = orig_weight.view(
-                    self.out_features,
-                    self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0],
-                )
+                orig_shape = orig_weight.shape
+                orig_weight = orig_weight.view(self.out_features, -1)
                 orig_weight = torch.transpose(orig_weight, 0, 1)
                 orig_weight = torch.mm(torch.linalg.inv(oft_mat).to(previous_dtype), orig_weight.to(previous_dtype))
                 orig_weight = torch.transpose(orig_weight, 0, 1)
-                orig_weight = orig_weight.view(
-                    self.out_features,
-                    self.in_features,
-                    base_layer.kernel_size[0],
-                    base_layer.kernel_size[0],
-                )
+                orig_weight = orig_weight.view(orig_shape)
 
                 self.set_base_weight(orig_weight.to(orig_dtype))
 
@@ -903,15 +890,23 @@ class Conv2d(nn.Module, OFTLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
+            # Rotate the weight, not the input: rotating unfolded input patches and folding them back is only
+            # equivalent to a convolution with the rotated weight when the patches do not overlap. Applying the
+            # adapters to the weight in order also matches what merge() does.
+            base_layer = self.get_base_layer()
+            weight = base_layer.weight
+            weight_2d = weight.view(self.out_features, -1)
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.oft_R.keys():
                     continue
 
-                oft_R = self.oft_R[active_adapter]
-                x = self._cast_input_dtype(x, oft_R.weight.dtype)
-                x = oft_R(x)
+                oft_mat = self.oft_R[active_adapter].get_weight()
+                weight_2d = torch.mm(oft_mat, weight_2d.t().to(oft_mat.dtype)).t()
+            weight = weight_2d.view(weight.shape).to(weight.dtype)
 
-            result = self.base_layer(x.to(previous_dtype), *args, **kwargs)
+            x = self._cast_input_dtype(x, weight.dtype)
+            bias = self._cast_input_dtype(base_layer.bias, weight.dtype)
+            result = base_layer._conv_forward(x, weight, bias)
 
         result = result.to(previous_dtype)
         return result
