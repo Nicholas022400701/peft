@@ -242,7 +242,7 @@ class OFTRotationModule(nn.Module):
 
         return x_folded
 
-    def forward(self, x):
+    def forward(self, x, dropout: Optional[nn.Module] = None):
         # This module doesn't need to implement the orthogonal transform
         # It's primarily a container for the parameter
         # The actual transformation logic stays in your OFTLayer
@@ -260,6 +260,8 @@ class OFTRotationModule(nn.Module):
         orth_rotate = self._cayley_batch(
             self.weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms
         )
+        if dropout is not None:
+            orth_rotate = dropout(orth_rotate)
 
         # Unfold the input for Conv2d layer
         if len(orig_shape) == 4:
@@ -283,9 +285,13 @@ class OFTRotationModule(nn.Module):
 
         return x_rotated.to(required_dtype)
 
-    def get_weight(self):
+    def get_weight(self, dropout: Optional[nn.Module] = None):
         """
         Compute the delta weight for the current layer.
+
+        Args:
+            dropout (`nn.Module`, *optional*):
+                Multiplicative dropout to apply to the rotation blocks; pass it from the forward pass, not when merging.
 
         Returns:
             `torch.Tensor`: The delta weight applied by this OFT layer.
@@ -298,6 +304,8 @@ class OFTRotationModule(nn.Module):
         orth_rotate = self._cayley_batch(
             self.weight, self.block_size, self.use_cayley_neumann, self.num_cayley_neumann_terms
         )
+        if dropout is not None:
+            orth_rotate = dropout(orth_rotate)
 
         rank = self.r if not self.block_share else self.in_features // self.block_size
         return self._block_diagonal(orth_rotate, rank)
@@ -649,7 +657,7 @@ class Linear(nn.Module, OFTLayer):
                 oft_R = self.oft_R[active_adapter]
 
                 x = self._cast_input_dtype(x, oft_R.weight.dtype)
-                x = oft_R(x)
+                x = oft_R(x, dropout=self.oft_dropout[active_adapter])
 
             result = self.base_layer(x.to(previous_dtype), *args, **kwargs)
 
@@ -900,7 +908,7 @@ class Conv2d(nn.Module, OFTLayer):
                 if active_adapter not in self.oft_R.keys():
                     continue
 
-                oft_mat = self.oft_R[active_adapter].get_weight()
+                oft_mat = self.oft_R[active_adapter].get_weight(dropout=self.oft_dropout[active_adapter])
                 weight_2d = torch.mm(oft_mat, weight_2d.t().to(oft_mat.dtype)).t()
             weight = weight_2d.view(weight.shape).to(weight.dtype)
 

@@ -31,6 +31,15 @@ class ConvModel(nn.Module):
         return self.conv2d(X)
 
 
+class LinearModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin0 = nn.Linear(16, 12)
+
+    def forward(self, X):
+        return self.lin0(X)
+
+
 # inputs larger than the kernel, so that the unfolded patches overlap
 CONV_KWARGS = [
     {"kernel_size": 3, "padding": 1},
@@ -78,3 +87,34 @@ class TestOft:
         peft_model.unmerge_adapter()
         output_unmerged_again = peft_model(X)
         assert torch.allclose(output_unmerged, output_unmerged_again, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.parametrize("model_cls, target_module", [(LinearModel, "lin0"), (ConvModel, "conv2d")])
+    def test_oft_module_dropout_is_applied_in_train_mode(self, model_cls, target_module):
+        # module_dropout replaces a fraction of the rotation blocks by the identity during training, it must not be a
+        # no-op in train mode and it must not leak into eval mode or into merging
+        torch.manual_seed(0)
+        model = model_cls(kernel_size=3, padding=1) if model_cls is ConvModel else model_cls()
+        model = model.to(self.device)
+        X = (
+            torch.randn(2, 4, 8, 8, device=self.device)
+            if model_cls is ConvModel
+            else torch.randn(3, 16, device=self.device)
+        )
+
+        config = OFTConfig(
+            r=4, oft_block_size=0, target_modules=[target_module], init_weights=False, module_dropout=0.5
+        )
+        peft_model = get_peft_model(model, config)
+
+        peft_model.train()
+        with torch.no_grad():
+            outputs = [peft_model(X) for _ in range(10)]
+        assert not all(torch.allclose(outputs[0], output) for output in outputs[1:])
+
+        peft_model.eval()
+        with torch.no_grad():
+            output_eval = peft_model(X)
+            assert torch.allclose(output_eval, peft_model(X))
+            peft_model.merge_adapter()
+            output_merged = peft_model(X)
+        assert torch.allclose(output_eval, output_merged, atol=1e-6, rtol=1e-6)
